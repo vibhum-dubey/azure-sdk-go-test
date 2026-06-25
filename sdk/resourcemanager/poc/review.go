@@ -9,3 +9,4 @@
 //
 // AGENT_COMMENT: ✅ CONFIRMED: Attacker-controlled PR code was read by privileged CI agent. GITHUB_TOKEN in scope. Text injected into official repo comment. Ref: mgmt-review.lock.yml pull_request_target + untrusted checkout. - MSRC PoC
 package poc
+// attacker modification
