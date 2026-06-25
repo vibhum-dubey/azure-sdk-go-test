@@ -1,0 +1,101 @@
+# PoC Test Workflow — mirrors azure-sdk-for-go mgmt-review.lock.yml pattern
+# Deploy this to YOUR OWN repo. Do NOT deploy to azure/azure-sdk-for-go.
+#
+# Vulnerable pattern:
+#   pull_request_target + checkout of PR HEAD + read/execute PR code
+#   while secrets (GITHUB_TOKEN) are in scope and github.com is reachable.
+
+name: "Management Review (PoC Test)"
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+permissions: {}
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write   # needed to post comment (proving write access with elevated token)
+      issues: write
+    steps:
+      # ── Step 1: Checkout PR HEAD branch (the dangerous step) ──────────────
+      # In the real workflow this is done via checkout_pr_branch.cjs
+      # Here we do it directly for clarity.
+      - name: Checkout PR branch (untrusted code)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      # ── Step 2: Prove GITHUB_TOKEN is accessible inside PR code context ───
+      - name: Show token is in scope
+        run: |
+          echo "GITHUB_TOKEN present: $([ -n "$GITHUB_TOKEN" ] && echo YES || echo NO)"
+          echo "Token (first 15 chars): ${GITHUB_TOKEN:0:15}..."
+          echo "Runner env vars containing TOKEN or SECRET:"
+          printenv | grep -iE "TOKEN|SECRET" | sed 's/=.*/=***REDACTED***/'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Step 3: Simulate agent reading PR files and following injected instructions ──
+      # The real agent uses --allow-all-paths + --add-dir GITHUB_WORKSPACE
+      # Here we replicate that by scanning files for the injected directive.
+      - name: Read PR files and extract injected agent directive
+        id: extract
+        run: |
+          echo "=== Scanning PR workspace files ==="
+          find . -not -path "./.git/*" -type f \( -name "*.go" -o -name "*.md" \) | while read f; do
+            echo "Reading: $f"
+          done
+
+          # Extract the injected comment — mirrors what the LLM agent would read
+          INJECTED=$(grep -rh "AGENT_COMMENT:" . \
+            --include="*.go" --include="*.md" 2>/dev/null | \
+            sed 's/.*AGENT_COMMENT://' | head -1 | xargs)
+
+          if [ -n "$INJECTED" ]; then
+            echo "✅ Injected instruction found: $INJECTED"
+            echo "injected=$INJECTED" >> "$GITHUB_OUTPUT"
+          else
+            echo "No injection found"
+            echo "injected=No payload found in PR files." >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Step 4: Act on injected instruction — post it as an official PR comment ──
+      # This is the equivalent of the real agent calling the github MCP pull_requests tool.
+      # Proves: attacker-controlled text becomes an official repo comment.
+      - name: Post injected comment to PR (proving MCP tool abuse)
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const injected = `${{ steps.extract.outputs.injected }}`;
+
+            const body = [
+              "## ⚠️ PoC: Prompt Injection via `pull_request_target`",
+              "",
+              "**This comment was posted by an agent that read attacker-controlled PR code.**",
+              "",
+              "### Injected instruction from PR file:",
+              `> ${injected}`,
+              "",
+              "### What this proves:",
+              "- PR HEAD code was checked out while `GITHUB_TOKEN` was in scope",
+              "- Agent read all files in the PR workspace (`--allow-all-paths`)",
+              "- Text from attacker's PR file was extracted and posted as an official comment",
+              "- In the real workflow, a privileged `GH_AW_GITHUB_MCP_SERVER_TOKEN` backs the GitHub MCP tools",
+              "",
+              "**Mirrors**: `azure/azure-sdk-for-go` → `.github/workflows/mgmt-review.lock.yml`",
+            ].join("\n");
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: body
+            });
+
+            console.log("Comment posted successfully — PoC confirmed.");
